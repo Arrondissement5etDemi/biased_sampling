@@ -1,6 +1,7 @@
 using LinearAlgebra
 using Optim
 using BenchmarkTools
+using SpecialFunctions
 
 function pretty_print(array)
     show(IOContext(stdout, :compact=>false), "text/plain", array)
@@ -129,4 +130,19 @@ function ϕ2ρ1D(ϕ, diam = 1)
     return ϕ/diam
 end
 
-test_opt()
+```generates random point in ball centered at \$center with radius \$r in dimension \$dim```
+function rand_pt_in_sphere(r, dim, center)
+    pt = 2*ones(dim)*r #just a point that's initially out of the ball
+    while norm(pt) > r
+        pt = rand(dim)*2*r .- r
+    end
+    return pt + center
+end
+
+```deletes a column of a matrix```
+dropcol(M::AbstractMatrix, j) = M[:, deleteat!(collect(axes(M, 2)), j)]
+
+```volume of a \$d-dimensional sphere of radius \$r```
+v1(r, d) = π^(d/2)/gamma(d/2 + 1)*r^d
+
+#test_opt()

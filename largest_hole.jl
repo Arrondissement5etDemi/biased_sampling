@@ -3,15 +3,7 @@ using Distributed
 @everywhere include("helper_funcs.jl")
 
 ```Distance in periodic boundary conditions```
-@everywhere function dist_pbc(parti1, parti2, l)
-    d = size(parti1)[1] #dimensionality
-    dist_vec = zeros(d)
-    for i = 1:d
-        central = parti1[i] - parti2[i]
-        dist_vec[i] = minimum(abs.([central, central - l, central + l]))
-    end
-    return norm(dist_vec)
-end
+@everywhere dist_pbc(parti1, parti2, l) = norm(-abs.(mod.(parti1 - parti2, l) .- l/2) .+ l/2)
 
 @everywhere mutable struct Box
     particles::Array{Float64, 2}
@@ -22,6 +14,11 @@ end
     ρInv
     equilibrate_biased!
     move!
+    move_test_point!
+    remove!
+    add!
+    attempt_remove!
+    attempt_add!
     
     function Box(_particles, _l)
         this = new()
@@ -39,40 +36,51 @@ end
         this.ρInv = function()
             return this.l^this.dim()/this.n()   
         end
-        this.equilibrate_biased! = function(weight_func, test_point; temperature = 1, sweeps = 100, displace = 0.2, hardcore = 1, cells_per_side = 10)
-            dist_vec = zeros(this.n())
-            for j = 1:this.n()
-                dist_vec[j] = dist_pbc(test_point, this.particles[:, j], this.l)
-            end
+        this.equilibrate_biased! = function(weight_func, test_point;
+             temperature = 1, sweeps = 100, displace = 0.2, hardcore = 1, cells_per_side = 10, λ = 0.1, evd = 3.9e-11)
+            dist_vec = vec(mapslices(x -> dist_pbc(test_point, x, b.l), b.particles; dims = 1))
             cl = cell_list(this, cells_per_side)
             cl_update_rate = Int(fld(this.l/cells_per_side, displace*2*sqrt(this.dim())))
-            tot_pe = total_potential_energy(this, cl, hardcore)
-            energy = biased_energy(tot_pe, weight_func, dist_vec)
-            hist = zeros(100, 2)
-            hist[:, 1] = 0.02:0.02:2.0
+            hist = zeros(200, 2)
+            hist[:, 1] = 0.02:0.02:4.0
             for i = 1:sweeps
                 if i % cl_update_rate == 1
                     cl = cell_list(this, cells_per_side)
                 end
-                for j = 1:this.n()
-                    old_coord = deepcopy(this.particles[:, j])
-                    old_energy = energy
-                    old_dist_vec = deepcopy(dist_vec)
-                    old_pe = tot_pe
-                    old_ej = particle_energy(old_coord, this, cl, hardcore)
-                    this.move!(j, displace, test_point, dist_vec)
-                    new_ej = particle_energy(this.particles[:, j], this, cl, hardcore)
-                    tot_pe = tot_pe - old_ej + new_ej
-                    energy = biased_energy(tot_pe, weight_func, dist_vec)
-                    if !boltzmann_accept(old_energy, energy, temperature)
-                        this.particles[:, j] = old_coord
-                        tot_pe = old_pe
-                        energy = old_energy
-                        dist_vec = old_dist_vec 
+                for j = 1:this.n() + 1
+                    if j <= this.n() #move the actual particles
+                        old_coord = deepcopy(this.particles[:, j])
+                        old_dist_vec = deepcopy(dist_vec)
+                        old_ej = particle_energy(old_coord, this, cl, hardcore)
+                        old_bias = weight_func(minimum(dist_vec))
+                        this.move!(j, displace, test_point, dist_vec)
+                        new_ej = particle_energy(this.particles[:, j], this, cl, hardcore)
+                        new_bias = weight_func(minimum(dist_vec))
+                        Δpe = new_ej - old_ej
+                        Δbias = new_bias - old_bias
+                        if !boltzmann_accept(0, Δpe + Δbias, temperature) #can the new energy be infinity and still be accepted???
+                            this.particles[:, j] = old_coord
+                            dist_vec = deepcopy(old_dist_vec) 
+                        end
+                    else #move the test particle
+                        old_tp = deepcopy(test_point)
+                        old_bias = weight_func(minimum(dist_vec))
+                        old_dist_vec = deepcopy(dist_vec)
+                        test_point = this.move_test_point!(displace, test_point, dist_vec)
+                        new_bias = weight_func(minimum(dist_vec))
+                        if !boltzmann_accept(old_bias, new_bias, temperature)
+                            test_point = deepcopy(old_tp)
+                            dist_vec = deepcopy(old_dist_vec) 
+                        end
                     end
                 end
+                if i%4 == 2
+                    this.attempt_remove!(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
+                elseif i%4 == 0
+                    this.attempt_add!(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
+                end
                 if i % 20 == 1
-                    println(string(i)*" "*string(hole_size_Ev(this, test_point)))
+                    println(string(i)*" "*string(minimum(dist_vec))*" "*string(this.n()))
                     flush(stdout)
                     dist_test_bin = Int(fld(minimum(dist_vec), 0.02) + 1)
                     hist[dist_test_bin, 2] += 1 
@@ -80,6 +88,7 @@ end
             end
             return hist
         end
+
         this.move! = function(j, displace, test_point, dist_vec)
             #move particle at j
             displaceVec = (rand(this.dim())*2.0 .- 1)*displace
@@ -88,6 +97,90 @@ end
             this.particles[:, j] = pj
             #update the vector of distances from pj to the test point
             dist_vec[j] = dist_pbc(test_point, pj, this.l)
+        end
+
+        this.move_test_point! = function(displace, test_point, dist_vec)
+            displaceVec = (rand(this.dim())*2.0 .- 1)*displace
+            new_test_point = mod.(test_point + displaceVec, this.l)
+            for j = 1:this.n()
+                dist_vec[j] = dist_pbc(new_test_point, this.particles[:, j], this.l)
+            end
+            return new_test_point
+        end
+
+        ```propose to remove the nearest neighbor from \$test_point if it is within distance \$λ\*\$D from the \$test_point```
+        this.remove! = function(λ, hardcore, cl, dist_vec)
+            #get the index of the particle to be potentially removed
+            min_dist, j = findmin(dist_vec)
+            #do nothing if the minimum distance is larger than λD
+            if min_dist > λ*hardcore
+                return zeros(this.dim(), 0)
+            end
+            #remove the particle at index j from the particle array
+            removed_particle = this.particles[:, j]
+            this.particles = dropcol(this.particles, j)
+            #delete the jth entry in dist_vec
+            deleteat!(dist_vec, j)
+            #remove the particle from the cell list and update the indices of every remaining particle
+            for i in eachindex(cl)
+                cl[i] = filter(x -> Int(x) ≠ j, cl[i])
+                for ii in eachindex(cl[i])
+                    if cl[i][ii] > j
+                        cl[i][ii] -= 1
+                    end
+                end
+            end
+            return removed_particle
+        end
+
+        ```proposes to add a particle in the ball with distance \$λ\*\$hardcore centered at \$test_point
+        then modifies \$this.particles, \$cl and \$dist_vec accordingly.```
+        this.add! = function(λ, test_point, hardcore, cl, dist_vec, new_particle = missing)
+            #generate a new actual particle if it's not already given
+            if ismissing(new_particle)
+                new_particle = rand_pt_in_sphere(λ*hardcore, this.dim(), test_point)
+            end
+            #add the new particle to the list of particles in the box. note that it's added as the last particle
+            this.particles = hcat(this.particles, new_particle)
+            #update the cell list
+            cell_length = this.l/size(cl, 1)
+            cell_inds = Int.(fld.(new_particle, cell_length) .+ 1)
+            cl[cell_inds...] = vcat(cl[cell_inds...], [this.n()])
+            #update the dist_vec
+            push!(dist_vec, dist_pbc(test_point, new_particle, this.l))
+            #that's it. We won't care at the moment whether this addition will be rejected. 
+            #that's not the business of this function. 
+            return new_particle
+        end
+
+        ```proposes and accepts or rejects a remove```
+        this.attempt_remove! = function(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
+            old_biase_energy = weight_func(minimum(dist_vec))
+            removed_particle = this.remove!(λ, hardcore, cl, dist_vec)
+            #do nothing if no particle is within the central sphere
+            if size(removed_particle, 2) == 0
+                return
+            end
+            Δpe = -particle_energy(removed_particle, this, cl, hardcore)
+            Δbiase = weight_func(minimum(dist_vec)) - old_biase_energy
+            Δenergy = Δpe + Δbiase
+            threshold = min(1, evd/(this.ρ()*v1(λ*hardcore, this.dim()))*exp(-Δenergy/temperature))
+            if rand() > threshold
+                this.add!(λ, test_point, hardcore, cl, dist_vec, removed_particle)
+            end
+        end
+
+        ```proposes and accepts or rejects an add```
+        this.attempt_add! = function(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
+            old_biase_energy = weight_func(minimum(dist_vec))
+            new_particle = this.add!(λ, test_point, hardcore, cl, dist_vec)
+            Δpe = particle_energy(new_particle, this, cl, hardcore)
+            Δbiase = weight_func(minimum(dist_vec)) - old_biase_energy
+            Δenergy = Δpe + Δbiase
+            threshold = min(1, v1(λ*hardcore, this.dim())*this.ρ()/evd*exp(-Δenergy/temperature))
+            if rand() > threshold
+                this.remove!(λ, hardcore, cl, dist_vec)
+            end
         end
         return this
     end
@@ -186,11 +279,11 @@ end
 
 @everywhere function cell_list(box, nCellsPerSide)
     dim = box.dim()
-    result = fill(zeros(1, 0), ntuple(i -> nCellsPerSide, dim)) #coordinates of particles in the cells
+    result = fill(zeros(0), ntuple(i -> nCellsPerSide, dim)) #to store indices of particles in the cells
     cell_length = box.l/nCellsPerSide
     for i in 1:box.n()
         cell_inds = Int.(fld.(box.particles[:, i], cell_length) .+ 1)
-        result[cell_inds...] = hcat(result[cell_inds...], [i])
+        result[cell_inds...] = vcat(result[cell_inds...], [i])
     end
     return result
 end
@@ -209,7 +302,7 @@ end
             current_cell_ind = mod.(test_cell_inds + collect(i) .- 1, nCellsPerSide) .+ 1
             current_neighbors = cl[current_cell_ind...]
             if size(current_neighbors, 2) > 0
-                dists = mapslices(x -> dist_pbc(box.particles[:, Int(x[1])], test_particle, l), current_neighbors; dims = 1)
+                dists = broadcast(x -> dist_pbc(box.particles[:, Int(x)], test_particle, l), current_neighbors)
                 dists = dists[dists .> 0]
                 if length(dists) > 0
                     dist_temp = minimum(dists)
@@ -230,8 +323,8 @@ end
 ```the local maximum of nearest neighbor distance, given a test point as the initial guess
 or: the radius of the largest hole that contains the test point```
 @everywhere function nnd_localmax(test_point, box, cl)
-    f(test_point) = -nearest_neighbor(test_point, box, cl)
-    opt = optimize(f, test_point, BFGS())
+    opt = optimize(test_p -> -nearest_neighbor(test_p, box, cl), test_point, GradientDescent(), Optim.Options(iterations = 5))
+    #println(Optim.minimizer(opt))
     return -Optim.minimum(opt)
 end
 
@@ -248,8 +341,13 @@ end
     return sum(mapslices(p -> particle_energy(p, box, cl, hardcore), box.particles; dims = 1))
 end
 
-@everywhere function biased_energy(total_potential_energy, weight_func, dist_vec) 
-    return weight_func(minimum(dist_vec)) + total_potential_energy
+@everywhere function biased_energy(total_potential_energy, weight_func, dist_vec; nsmallest = 1)
+    smallest_avr = mean(partialsort(dist_vec, 1:nsmallest)) 
+    return weight_func(smallest_avr) + total_potential_energy
+end
+
+@everywhere function biased_energy2(total_potential_energy, weight_func, test_point, box, cl)
+    return weight_func(nnd_localmax(test_point, box, cl)) + total_potential_energy
 end
 
 #trial weight functions here###
@@ -259,7 +357,7 @@ function weight1(x)
     elseif x < 1.5
         return -38.089*x + 19.505
     else
-        return Inf
+        return -38.089*1.5 + 19.505
     end
 end
 
@@ -279,14 +377,16 @@ function parse_config(path, arg)
     return test_point, Box(particles, 1000/0.95)
 end
 
-function maiiin()
-    test_point, box1D = parse_config(ARGS[1], ARGS[2])
-    #integer_lattice(1000, 0.95)
-    #test_point = rand(box1D.dim())*box1D.l
-    #box1D.equilibrate_biased!(weight1, test_point; sweeps = 3000, displace = 0.1, cells_per_side = 200)
-    hist = box1D.equilibrate_biased!(weight1, test_point; sweeps = 80000, displace = 0.1, cells_per_side = 200)
-    pretty_print(hist)
-    println(test_point)
-    pretty_print(box1D.particles)
-    flush(stdout)
-end
+b = integer_lattice(200, 0.95)
+test_point = b.l*rand(b.dim())
+cl = cell_list(b, 10)
+dist_vec = vec(mapslices(x -> dist_pbc(test_point, x, b.l), b.particles; dims = 1))
+λ = 0.1
+hardcore = 1
+b.add!(λ, test_point, hardcore, cl, dist_vec)
+println(b.particles)
+b.remove!(λ, hardcore, cl, dist_vec)
+println(b.particles)
+weight_func = weight1
+evd = 3.5e-11
+temperature = 1
