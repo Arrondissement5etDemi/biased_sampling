@@ -36,13 +36,14 @@ using Distributed
         this.ρInv = function()
             return this.l^this.dim()/this.n()   
         end
+
         this.equilibrate_biased! = function(weight_func, test_point;
-             temperature = 1, sweeps = 100, displace = 0.2, hardcore = 1, cells_per_side = 10, λ = 0.1, evd = 3.9e-11)
-            dist_vec = vec(mapslices(x -> dist_pbc(test_point, x, b.l), b.particles; dims = 1))
+             temperature = 1, sweeps = 100, displace = 0.1, hardcore = 1, cells_per_side = 10, λ = 0.1, evd = 3.9e-11)
+            dist_vec = vec(mapslices(x -> dist_pbc(test_point, x, this.l), this.particles; dims = 1))
             cl = cell_list(this, cells_per_side)
             cl_update_rate = Int(fld(this.l/cells_per_side, displace*2*sqrt(this.dim())))
             hist = zeros(200, 2)
-            hist[:, 1] = 0.02:0.02:4.0
+            hist[:, 1] = 0.01:0.01:2.0
             for i = 1:sweeps
                 if i % cl_update_rate == 1
                     cl = cell_list(this, cells_per_side)
@@ -74,19 +75,26 @@ using Distributed
                         end
                     end
                 end
-                if i%4 == 2
+                if i%200 == 100
                     this.attempt_remove!(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
-                elseif i%4 == 0
+                elseif i%200 == 0
                     this.attempt_add!(λ, test_point, hardcore, cl, dist_vec, weight_func, evd, temperature)
                 end
-                if i % 20 == 1
-                    println(string(i)*" "*string(minimum(dist_vec))*" "*string(this.n()))
+                if i % 20 == 0
+                    nnd = minimum(dist_vec)
+                    println(string(i)*" "*string(nnd)*" "*string(this.n()))
                     flush(stdout)
-                    dist_test_bin = Int(fld(minimum(dist_vec), 0.02) + 1)
-                    hist[dist_test_bin, 2] += 1 
+                    if nnd > 0.81 && nnd < 0.87
+                        println(test_point)
+                        println(this.particles')
+                        break
+                    end
+                    #=dist_test_bin = Int(fld(minimum(dist_vec), 0.01) + 1)
+                    hist[dist_test_bin, 2] += 1 =#
                 end
             end
-            return hist
+            hist[:, 2] = hist[:, 2]/(sweeps/20)
+            return hist, test_point
         end
 
         this.move! = function(j, displace, test_point, dist_vec)
@@ -138,7 +146,7 @@ using Distributed
         this.add! = function(λ, test_point, hardcore, cl, dist_vec, new_particle = missing)
             #generate a new actual particle if it's not already given
             if ismissing(new_particle)
-                new_particle = rand_pt_in_sphere(λ*hardcore, this.dim(), test_point)
+                new_particle = mod.(rand_pt_in_sphere(λ*hardcore, this.dim(), test_point), this.l)
             end
             #add the new particle to the list of particles in the box. note that it's added as the last particle
             this.particles = hcat(this.particles, new_particle)
@@ -236,6 +244,24 @@ function triangleLatt418(rho)
    end
    return Box(particles, l);
 end
+
+function triangleLatt780(rho)
+    n, p, q = 780, 26, 30
+    particles = zeros(2, n)
+    l = √(n/rho)
+    distX, distY = l/p, l/q
+    for i = 1:p
+        particles[:, i] = [(i - 1)*distX, 0]
+    end
+    for i = p + 1:2*p
+        particles[:, i] = [0.5*distX + particles[1, i - p], distY]
+    end
+    smart_modulo(x, y) = ifelse(x%y != 0, x%y, y)
+    for i = 2*p + 1:n
+        particles[:, i] = [particles[1, smart_modulo(i, 2*p)], distY*fld(i - 1, p)]
+    end
+    return Box(particles, l);
+ end
 
 function integer_lattice(n, ρ)
     l = n/ρ
@@ -350,17 +376,6 @@ end
     return weight_func(nnd_localmax(test_point, box, cl)) + total_potential_energy
 end
 
-#trial weight functions here###
-function weight1(x)
-    if x < 0.5
-        return -38.089*0.5 + 19.505
-    elseif x < 1.5
-        return -38.089*x + 19.505
-    else
-        return -38.089*1.5 + 19.505
-    end
-end
-
 function parse_config(path, arg)
     f = open(path*string(arg)*".out", "r")
     for i = 1:4103
@@ -377,16 +392,3 @@ function parse_config(path, arg)
     return test_point, Box(particles, 1000/0.95)
 end
 
-b = integer_lattice(200, 0.95)
-test_point = b.l*rand(b.dim())
-cl = cell_list(b, 10)
-dist_vec = vec(mapslices(x -> dist_pbc(test_point, x, b.l), b.particles; dims = 1))
-λ = 0.1
-hardcore = 1
-b.add!(λ, test_point, hardcore, cl, dist_vec)
-println(b.particles)
-b.remove!(λ, hardcore, cl, dist_vec)
-println(b.particles)
-weight_func = weight1
-evd = 3.5e-11
-temperature = 1

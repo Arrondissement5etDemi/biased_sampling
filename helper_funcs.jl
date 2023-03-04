@@ -118,6 +118,21 @@ function boltzmann_accept(oldE::Real, newE::Real, temperature::Real)::Bool
 	return false
 end
 
+function q6_2D(particles, l) 
+    n = size(particles, 2)
+    sum = 0
+    for i = 1:n
+        p = particles[:, i];
+        for j = 1:(i - 1)
+            q = particles[:, j]
+            pq_vec = l/2 .- abs.(mod.(p - q, l) .- l/2)
+            theta = atan(pq_vec[2], pqvec[1])
+            sum += (cos(6*theta) + im*sin(6*theta))
+        end
+    end
+    return norm(sum)/(n*(n - 1)/2)
+end
+
 function ϕ2ρ3D(ϕ, diam = 1)
     return 6*ϕ/(π*diam^3)
 end
