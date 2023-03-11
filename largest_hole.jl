@@ -378,7 +378,7 @@ end
 
 function parse_config(path, arg)
     f = open(path*string(arg)*".out", "r")
-    for i = 1:4103
+    for _ = 1:4103
         readline(f) #dummies
     end
     test_point = [parse(Float64, chop(readline(f); head=1, tail=1))]
