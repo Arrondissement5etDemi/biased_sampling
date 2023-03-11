@@ -292,7 +292,7 @@ function triangle_latt(n_per_side, ρ, test_point = missing)
     return rhombic_box(particles, basis, test_point)
 end
 
-b = triangle_latt(20, ϕ2ρ2D(0.73), [0.45, 0])
+b = triangle_latt(20, ϕ2ρ2D(0.73), rand(2))
 weight_func(x) = -20x
 hist = b.equilibrate_biased!(weight_func; displace = 0.1/√(b.n()), sweeps = 10000)
 pl = b.visualize()
